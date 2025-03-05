@@ -65,7 +65,7 @@ module Superenv
     self["RUSTFLAGS"] = Hardware.rustflags_target_cpu(effective_arch)
     self["PATH"] = determine_path
     self["PKG_CONFIG_PATH"] = determine_pkg_config_path
-    self["PKG_CONFIG_LIBDIR"] = determine_pkg_config_libdir
+    self["PKG_CONFIG_LIBDIR"] = determine_pkg_config_libdir || ""
     self["HOMEBREW_CCCFG"] = determine_cccfg
     self["HOMEBREW_OPTIMIZATION_LEVEL"] = "Os"
     self["HOMEBREW_BREW_FILE"] = HOMEBREW_BREW_FILE.to_s
@@ -93,6 +93,11 @@ module Superenv
     # Prevent Go from automatically downloading a newer toolchain than the one that we have.
     # https://tip.golang.org/doc/toolchain
     self["GOTOOLCHAIN"] = "local"
+    # Prevent Python packages from using bundled libraries by default.
+    # Currently for hidapi, pyzmq and pynacl
+    self["HIDAPI_SYSTEM_HIDAPI"] = "1"
+    self["PYZMQ_NO_BUNDLE"] = "1"
+    self["SODIUM_INSTALL"] = "system"
 
     set_debug_symbols if debug_symbols
 

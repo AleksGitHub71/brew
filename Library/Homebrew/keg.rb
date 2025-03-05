@@ -77,39 +77,7 @@ class Keg
 
   # Locale-specific directories have the form `language[_territory][.codeset][@modifier]`
   LOCALEDIR_RX = %r{(locale|man)/([a-z]{2}|C|POSIX)(_[A-Z]{2})?(\.[a-zA-Z\-0-9]+(@.+)?)?}
-  INFOFILE_RX = %r{info/([^.].*?\.info|dir)$}
-  KEG_LINK_DIRECTORIES = %w[
-    bin etc include lib sbin share var
-  ].freeze
-  MUST_EXIST_SUBDIRECTORIES = (
-    KEG_LINK_DIRECTORIES - %w[var] + %w[
-      opt
-      var/homebrew/linked
-    ]
-  ).map { |dir| HOMEBREW_PREFIX/dir }.sort.uniq.freeze
-
-  # Keep relatively in sync with
-  # {https://github.com/Homebrew/install/blob/HEAD/install.sh}
-  MUST_EXIST_DIRECTORIES = (MUST_EXIST_SUBDIRECTORIES + [
-    HOMEBREW_CELLAR,
-  ].sort.uniq).freeze
-  MUST_BE_WRITABLE_DIRECTORIES = (
-    %w[
-      etc/bash_completion.d lib/pkgconfig
-      share/aclocal share/doc share/info share/locale share/man
-      share/man/man1 share/man/man2 share/man/man3 share/man/man4
-      share/man/man5 share/man/man6 share/man/man7 share/man/man8
-      share/zsh share/zsh/site-functions
-      var/log
-    ].map { |dir| HOMEBREW_PREFIX/dir } + MUST_EXIST_SUBDIRECTORIES + [
-      HOMEBREW_CACHE,
-      HOMEBREW_CELLAR,
-      HOMEBREW_LOCKS,
-      HOMEBREW_LOGS,
-      HOMEBREW_REPOSITORY,
-      Language::Python.homebrew_site_packages,
-    ]
-  ).sort.uniq.freeze
+  INFOFILE_RX = %r{info/([^.].*?\.info(\.gz)?|dir)$}
 
   # These paths relative to the keg's share directory should always be real
   # directories in the prefix, never symlinks.
@@ -144,6 +112,52 @@ class Keg
 
   def self.all
     Formula.racks.flat_map(&:subdirs).map { |d| new(d) }
+  end
+
+  def self.keg_link_directories
+    @keg_link_directories ||= %w[
+      bin etc include lib sbin share var
+    ].freeze
+  end
+
+  def self.must_exist_subdirectories
+    @must_exist_subdirectories ||= (
+    keg_link_directories - %w[var] + %w[
+      opt
+      var/homebrew/linked
+    ]
+  ).map { |dir| HOMEBREW_PREFIX/dir }.sort.uniq.freeze
+  end
+
+  # Keep relatively in sync with
+  # {https://github.com/Homebrew/install/blob/HEAD/install.sh}
+  def self.must_exist_directories
+    @must_exist_directories ||= (must_exist_subdirectories + [
+      HOMEBREW_CELLAR,
+    ].sort.uniq).freeze
+  end
+
+  # Keep relatively in sync with
+  # {https://github.com/Homebrew/install/blob/HEAD/install.sh}
+  def self.must_be_writable_directories
+    @must_be_writable_directories ||= (
+    %w[
+      etc/bash_completion.d lib/pkgconfig
+      share/aclocal share/doc share/info share/locale share/man
+      share/man/man1 share/man/man2 share/man/man3 share/man/man4
+      share/man/man5 share/man/man6 share/man/man7 share/man/man8
+      share/zsh share/zsh/site-functions
+      share/pwsh share/pwsh/completions
+      var/log
+    ].map { |dir| HOMEBREW_PREFIX/dir } + must_exist_subdirectories + [
+      HOMEBREW_CACHE,
+      HOMEBREW_CELLAR,
+      HOMEBREW_LOCKS,
+      HOMEBREW_LOGS,
+      HOMEBREW_REPOSITORY,
+      Language::Python.homebrew_site_packages,
+    ]
+  ).sort.uniq.freeze
   end
 
   attr_reader :path, :name, :linked_keg_record, :opt_record
@@ -268,7 +282,7 @@ class Keg
       LinkageCacheStore.new(path, db).delete!
     end
 
-    path.rmtree
+    FileUtils.rm_r(path)
     path.parent.rmdir_if_possible
     remove_opt_record if optlinked?
     remove_linked_keg_record if linked?
@@ -288,8 +302,8 @@ class Keg
 
     dirs = []
 
-    keg_directories = KEG_LINK_DIRECTORIES.map { |d| path/d }
-                                          .select(&:exist?)
+    keg_directories = self.class.keg_link_directories.map { |d| path/d }
+                          .select(&:exist?)
     keg_directories.each do |dir|
       dir.find do |src|
         dst = HOMEBREW_PREFIX + src.relative_path_from(path)
@@ -316,7 +330,7 @@ class Keg
     unless dry_run
       remove_old_aliases
       remove_linked_keg_record if linked?
-      (dirs - MUST_EXIST_SUBDIRECTORIES).reverse_each(&:rmdir_if_possible)
+      (dirs - self.class.must_exist_subdirectories).reverse_each(&:rmdir_if_possible)
     end
 
     ObserverPathnameExtension.n
@@ -341,6 +355,7 @@ class Keg
     when :zsh
       dir = path/"share/zsh/site-functions"
       dir if dir.directory? && dir.children.any? { |f| f.basename.to_s.start_with?("_") }
+    when :pwsh then path/"share/pwsh/completions"
     end
     dir&.directory? && !dir.children.empty?
   end
@@ -375,6 +390,7 @@ class Keg
     (path/"share/emacs/site-lisp"/name).children.any? { |f| ELISP_EXTENSIONS.include? f.extname }
   end
 
+  sig { returns(PkgVersion) }
   def version
     require "pkg_version"
     PkgVersion.parse(path.basename.to_s)
@@ -539,6 +555,32 @@ class Keg
   def delete_pyc_files!
     path.find { |pn| pn.delete if PYC_EXTENSIONS.include?(pn.extname) }
     path.find { |pn| FileUtils.rm_rf pn if pn.basename.to_s == "__pycache__" }
+  end
+
+  def normalize_pod2man_outputs!
+    # Only process uncompressed manpages, which end in a digit
+    manpages = Dir[path/"share/man/*/*.[1-9]"]
+    generated_regex = /^\.\\"\s*Automatically generated by .*\n/
+    manpages.each do |f|
+      manpage = Pathname.new(f)
+      next unless manpage.file?
+
+      content = manpage.read
+      content = content.gsub(generated_regex, "")
+      content = content.lines.map do |line|
+        next line unless line.start_with?(".TH")
+
+        # Split the line by spaces, but preserve quoted strings
+        parts = line.split(/\s(?=(?:[^"]|"[^"]*")*$)/)
+        next line if parts.length != 6
+
+        # pod2man embeds the perl version used into the 5th field of the footer
+        T.must(parts[4]).gsub!(/^"perl v.*"$/, "\"\"")
+        "#{parts.join(" ")}\n"
+      end.join
+
+      manpage.atomic_write(content)
+    end
   end
 
   def binary_executable_or_library_files

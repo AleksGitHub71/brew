@@ -1,4 +1,4 @@
-# typed: true # rubocop:todo Sorbet/StrictSigil
+# typed: strict
 # frozen_string_literal: true
 
 require "language/python"
@@ -8,16 +8,19 @@ require "utils/service"
 class Caveats
   extend Forwardable
 
+  sig { returns(Formula) }
   attr_reader :formula
 
+  sig { params(formula: Formula).void }
   def initialize(formula)
     @formula = formula
   end
 
+  sig { returns(String) }
   def caveats
     caveats = []
+    build = formula.build
     begin
-      build = formula.build
       formula.build = Tab.for_formula(formula)
       string = formula.caveats.to_s
       caveats << "#{string.chomp}\n" unless string.empty?
@@ -26,7 +29,7 @@ class Caveats
     end
     caveats << keg_only_text
 
-    valid_shells = [:bash, :zsh, :fish].freeze
+    valid_shells = [:bash, :zsh, :fish, :pwsh].freeze
     current_shell = Utils::Shell.preferred || Utils::Shell.parent
     shells = if current_shell.present? &&
                 (shell_sym = current_shell.to_sym) &&
@@ -46,6 +49,7 @@ class Caveats
 
   delegate [:empty?, :to_s] => :caveats
 
+  sig { params(skip_reason: T::Boolean).returns(T.nilable(String)) }
   def keg_only_text(skip_reason: false)
     return unless formula.keg_only?
 
@@ -99,16 +103,18 @@ class Caveats
 
   private
 
+  sig { returns(T.nilable(Keg)) }
   def keg
-    @keg ||= [formula.prefix, formula.opt_prefix, formula.linked_keg].filter_map do |d|
+    @keg ||= T.let([formula.prefix, formula.opt_prefix, formula.linked_keg].filter_map do |d|
       Keg.new(d.resolved_path)
     rescue
       nil
-    end.first
+    end.first, T.nilable(Keg))
   end
 
+  sig { params(shell: Symbol).returns(T.nilable(String)) }
   def function_completion_caveats(shell)
-    return unless keg
+    return unless (keg = self.keg)
     return unless which(shell.to_s, ORIGINAL_PATHS)
 
     completion_installed = keg.completion_installed?(shell)
@@ -128,7 +134,7 @@ class Caveats
           #{root_dir}/etc/bash_completion.d
       EOS
     when :fish
-      fish_caveats = +"fish #{installed.join(" and ")} have been installed to:"
+      fish_caveats = "fish #{installed.join(" and ")} have been installed to:"
       fish_caveats << "\n  #{root_dir}/share/fish/vendor_completions.d" if completion_installed
       fish_caveats << "\n  #{root_dir}/share/fish/vendor_functions.d" if functions_installed
       fish_caveats.freeze
@@ -137,12 +143,18 @@ class Caveats
         zsh #{installed.join(" and ")} have been installed to:
           #{root_dir}/share/zsh/site-functions
       EOS
+    when :pwsh
+      <<~EOS
+        PowerShell completion has been installed to:
+          #{root_dir}/share/pwsh/completions
+      EOS
     end
   end
 
+  sig { returns(T.nilable(String)) }
   def elisp_caveats
     return if formula.keg_only?
-    return unless keg
+    return unless (keg = self.keg)
     return unless keg.elisp_installed?
 
     <<~EOS
@@ -151,6 +163,7 @@ class Caveats
     EOS
   end
 
+  sig { returns(T.nilable(String)) }
   def service_caveats
     return if !formula.service? && !Utils::Service.installed?(formula) && !keg&.plist_installed?
     return if formula.service? && !formula.service.command? && !Utils::Service.installed?(formula)

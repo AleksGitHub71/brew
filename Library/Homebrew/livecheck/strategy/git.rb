@@ -1,6 +1,8 @@
 # typed: strict
 # frozen_string_literal: true
 
+require "addressable"
+require "livecheck/strategic"
 require "system_command"
 
 module Homebrew
@@ -24,7 +26,11 @@ module Homebrew
       #
       # @api public
       class Git
+        extend Strategic
         extend SystemCommand::Mixin
+
+        # Used to cache processed URLs, to avoid duplicating effort.
+        @processed_urls = T.let({}, T::Hash[String, String])
 
         # The priority of the strategy on an informal scale of 1 to 10 (from
         # lowest to highest).
@@ -34,12 +40,75 @@ module Homebrew
         # regex isn't provided.
         DEFAULT_REGEX = /\D*(.+)/
 
+        GITEA_INSTANCES = T.let(%w[
+          codeberg.org
+          gitea.com
+          opendev.org
+          tildegit.org
+        ].freeze, T::Array[String])
+        private_constant :GITEA_INSTANCES
+
+        GOGS_INSTANCES = T.let(%w[
+          lolg.it
+        ].freeze, T::Array[String])
+        private_constant :GOGS_INSTANCES
+
+        # Processes and returns the URL used by livecheck.
+        sig { params(url: String).returns(String) }
+        def self.preprocess_url(url)
+          processed_url = @processed_urls[url]
+          return processed_url if processed_url
+
+          begin
+            uri = Addressable::URI.parse url
+          rescue Addressable::URI::InvalidURIError
+            return url
+          end
+
+          host = uri.host
+          path = uri.path
+          return url if host.nil? || path.nil?
+
+          host = "github.com" if host == "github.s3.amazonaws.com"
+          path = path.delete_prefix("/").delete_suffix(".git")
+          scheme = uri.scheme
+
+          if host == "github.com"
+            return url if path.match? %r{/releases/latest/?$}
+
+            owner, repo = path.delete_prefix("downloads/").split("/")
+            processed_url = "#{scheme}://#{host}/#{owner}/#{repo}.git"
+          elsif GITEA_INSTANCES.include?(host)
+            return url if path.match? %r{/releases/latest/?$}
+
+            owner, repo = path.split("/")
+            processed_url = "#{scheme}://#{host}/#{owner}/#{repo}.git"
+          elsif GOGS_INSTANCES.include?(host)
+            owner, repo = path.split("/")
+            processed_url = "#{scheme}://#{host}/#{owner}/#{repo}.git"
+          # sourcehut
+          elsif host == "git.sr.ht"
+            owner, repo = path.split("/")
+            processed_url = "#{scheme}://#{host}/#{owner}/#{repo}"
+          # GitLab (gitlab.com or self-hosted)
+          elsif path.include?("/-/archive/")
+            processed_url = url.sub(%r{/-/archive/.*$}i, ".git")
+          end
+
+          if processed_url && (processed_url != url)
+            @processed_urls[url] = processed_url
+          else
+            url
+          end
+        end
+
         # Whether the strategy can be applied to the provided URL.
         #
         # @param url [String] the URL to match against
         # @return [Boolean]
-        sig { params(url: String).returns(T::Boolean) }
+        sig { override.params(url: String).returns(T::Boolean) }
         def self.match?(url)
+          url = preprocess_url(url)
           (DownloadStrategyDetector.detect(url) <= GitDownloadStrategy) == true
         end
 
@@ -119,16 +188,17 @@ module Homebrew
         #
         # @param url [String] the URL of the Git repository to check
         # @param regex [Regexp, nil] a regex used for matching versions
+        # @param options [Options] options to modify behavior
         # @return [Hash]
         sig {
-          params(
+          override(allow_incompatible: true).params(
             url:     String,
             regex:   T.nilable(Regexp),
-            _unused: T.untyped,
+            options: Options,
             block:   T.nilable(Proc),
-          ).returns(T::Hash[Symbol, T.untyped])
+          ).returns(T::Hash[Symbol, T.anything])
         }
-        def self.find_versions(url:, regex: nil, **_unused, &block)
+        def self.find_versions(url:, regex: nil, options: Options.new, &block)
           match_data = { matches: {}, regex:, url: }
 
           tags_data = tag_info(url, regex)
